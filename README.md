@@ -32,9 +32,8 @@ All of my nodes are created with the help of AI, so there may or may not be redu
 - Or download through the ComfyUI Manager.
 
 **❗❗IMPORTANT❗❗**
-
-If your trying to install LTX Director through the manager, make sure you download the nightly version. The manager is delayed in showing the latest updates.
-ALSO you need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
+If you don't see the latest version (v1.3.5) yet in the managaer then just downloaded the nightly version (or fetch the updates to update the list to see the latest version). 
+Also you will need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest version as well. You cannot use this node without updating ComfyUI-LTXVideo!
 
 # 🔄 Recent Updates
 
@@ -50,7 +49,7 @@ ALSO you need to update ComfyUI-LTXVideo and ComfyUI-KJNodes to the latest versi
     - Fixed epsilon input overlapping custom_width input
     - Fixed invisible widgets in nodes 2.0 when toggling widget visibility through settings menu
 
-If anyone find anymore bugs or has idea for improvements please let me know! 
+If anyone finds anymore bugs or has idea for improvements please let me know! 
 
 
 **v1.3.1**
@@ -233,6 +232,6 @@ Fixed everything so far. If there are any other issue or bugs you find please le
 
 # 💡 Additional Info
 
-I made these nodes knowing almost nothing about python and a beginner level knowledge of javascript. Feel free to suggest improvements, and if you run into any bugs let me know.
+I made these nodes knowing little about python and a beginner level understanding of javascript. Feel free to suggest improvements, and if you run into any bugs let me know.
 
 For those asking, I mainly used gemini to create these nodes.
