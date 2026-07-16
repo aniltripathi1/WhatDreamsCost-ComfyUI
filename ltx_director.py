@@ -20,16 +20,8 @@ from aiohttp import web
 
 from comfy_api.latest import io
 
-from .prompt_relay import (
-    get_raw_tokenizer,
-    map_token_indices,
-    build_segments,
-    create_mask_fn,
-    distribute_segment_lengths,
-)
-
-from .patches import detect_model_type, apply_patches, get_current_node_id
-import weakref
+from . import kling_client
+from . import video_utils
 
 log = logging.getLogger(__name__)
 
@@ -62,9 +54,8 @@ try:
 except Exception:
     pass
 
-# Custom socket type shared with LTXSequencer
-GuideData = io.Custom("GUIDE_DATA")
-MotionGuideData = io.Custom("MOTION_GUIDE_DATA")
+# Custom socket carrying the generated Kling result to the output node.
+KlingVideo = io.Custom("KLING_VIDEO")
 
 # --- File Check Endpoint for Deduplication ---
 @PromptServer.instance.routes.get("/ltx_director_check_file")
@@ -734,136 +725,46 @@ def _build_combined_audio(timeline_data_str: str, start_frame: int, duration_fra
     return {"waveform": out_waveform.unsqueeze(0), "sample_rate": target_sr}
 
 
-def _convert_to_latent_lengths(pixel_lengths, temporal_stride, latent_frames):
-    """Convert pixel-space segment lengths to integer latent-space lengths using the
-    largest-remainder method. Targets the full `latent_frames` when the pixel sum looks
-    like full coverage (within one stride of latent_frames * stride). Otherwise targets
-    round(total_pixel / temporal_stride) so partial-coverage timelines stay partial.
-    """
-    if not pixel_lengths:
-        return []
-    total_pixel = sum(pixel_lengths)
-    if total_pixel <= 0:
-        return [1] * len(pixel_lengths)
-
-    naive_total = max(1, round(total_pixel / temporal_stride))
-    target_total = min(latent_frames, naive_total)
-    # Within one frame of full → user clearly intended full coverage; pin to latent_frames.
-    if target_total >= latent_frames - 1:
-        target_total = latent_frames
-
-    exact = [p * target_total / total_pixel for p in pixel_lengths]
-    result = [int(e) for e in exact]
-    diff = target_total - sum(result)
-    if diff > 0:
-        order = sorted(range(len(exact)), key=lambda i: -(exact[i] - int(exact[i])))
-        for k in range(diff):
-            result[order[k % len(order)]] += 1
-
-    # Ensure every segment has ≥ 1 latent frame (steal from the largest if needed).
-    for i in range(len(result)):
-        if result[i] < 1:
-            max_idx = max(range(len(result)), key=lambda j: result[j])
-            if result[max_idx] > 1:
-                result[max_idx] -= 1
-                result[i] = 1
-
-    return result
+def _snap_kling_duration(seconds: float) -> int:
+    """Kling clips are 5 or 10 seconds; snap a requested length to the nearest."""
+    try:
+        return 10 if float(seconds) > 7.5 else 5
+    except Exception:
+        return 5
 
 
-_CLONED_MODEL_CACHE = weakref.WeakKeyDictionary()
+def _resolve_input_path(rel_or_name: str):
+    """Resolve an imageFile/videoFile (input-relative) to an absolute path, checking the
+    ComfyUI input dir and the whatdreamscost/ subfolder (where uploads land)."""
+    if not rel_or_name:
+        return None
+    base = folder_paths.get_input_directory()
+    candidates = [
+        os.path.join(base, rel_or_name),
+        os.path.join(base, "whatdreamscost", os.path.basename(rel_or_name)),
+    ]
+    for p in candidates:
+        if os.path.exists(p) and os.path.isfile(p):
+            return p
+    return None
 
-def _encode_relay(model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon):
-    for name, val in (("global_prompt", global_prompt),
-                      ("local_prompts", local_prompts),
-                      ("segment_lengths", segment_lengths)):
-        if val is None:
-            raise ValueError(
-                f"PromptRelay: '{name}' arrived as None. "
-                "Likely causes: a stale workflow JSON saved with null, the timeline "
-                "editor's web extension failing to load, or an upstream node returning None. "
-                "Set the field to an empty string or fix the upstream connection."
-            )
 
-    # Split prompts but do NOT filter out empty ones yet, so we can detect them
-    locals_list = [p.strip() for p in local_prompts.split("|")]
-    
-    unique_id = get_current_node_id()
-
-    # If there is at most one segment on the timeline, bypass attention masking for full speed
-    if len(locals_list) <= 1:
-        local_p = locals_list[0] if (locals_list and locals_list[0]) else ""
-        if global_prompt.strip() and local_p.strip():
-            active_prompt = f"{global_prompt.strip()}, {local_p.strip()}"
-        else:
-            active_prompt = local_p.strip() if local_p.strip() else global_prompt.strip()
-
-        log.info(f"[PromptRelay] Single prompt workflow detected ('{active_prompt}'). Bypassing attention masking for maximum speed.")
-        conditioning = clip.encode_from_tokens_scheduled(clip.tokenize(active_prompt))
-        
-        node_cache = _CLONED_MODEL_CACHE.setdefault(model, {})
-        cache_key = ("unpatched", unique_id)
-        if cache_key in node_cache:
-            patched = node_cache[cache_key]
-        else:
-            patched = model.clone()
-            to = patched.model_options.setdefault("transformer_options", {})
-            to["promptrelay_mask_fn"] = None
-            node_cache[cache_key] = patched
-            
-        return patched, conditioning
-
-    # Check if any specific segment is empty and apply fallbacks
-    for i, p in enumerate(locals_list):
-        if not p:
-            fallback = global_prompt.strip() if global_prompt else "video"
-            if not fallback:
-                fallback = "video"
-            locals_list[i] = fallback
-
-    arch, patch_size, temporal_stride = detect_model_type(model)
-
-    samples = latent["samples"]
-    latent_frames = samples.shape[2]
-    tokens_per_frame = (samples.shape[3] // patch_size[1]) * (samples.shape[4] // patch_size[2])
-
-    parsed_lengths = None
-    if segment_lengths.strip():
-        pixel_lengths = [int(float(x.strip())) for x in segment_lengths.split(",") if x.strip()]
-        parsed_lengths = _convert_to_latent_lengths(pixel_lengths, temporal_stride, latent_frames)
-
-    raw_tokenizer = get_raw_tokenizer(clip)
-    full_prompt, token_ranges = map_token_indices(raw_tokenizer, global_prompt, locals_list)
-
-    log.info("[PromptRelay] Global: tokens [0:%d] (%d tokens)", token_ranges[0][0], token_ranges[0][0])
-    for i, (s, e) in enumerate(token_ranges):
-        log.info("[PromptRelay] Segment %d: tokens [%d:%d] (%d tokens)", i, s, e, e - s)
-
-    conditioning = clip.encode_from_tokens_scheduled(clip.tokenize(full_prompt))
-
-    effective_lengths = distribute_segment_lengths(len(locals_list), latent_frames, parsed_lengths)
-
-    log.info(
-        "[PromptRelay] Latent: %d frames, %d tokens/frame, segments: %s",
-        latent_frames, tokens_per_frame, effective_lengths,
-    )
-
-    q_token_idx = build_segments(token_ranges, effective_lengths, epsilon, None)
-    mask_fn = create_mask_fn(q_token_idx, tokens_per_frame, latent_frames)
-
-    node_cache = _CLONED_MODEL_CACHE.setdefault(model, {})
-    cache_key = ("patched", unique_id)
-    if cache_key in node_cache:
-        patched = node_cache[cache_key]
-    else:
-        patched = model.clone()
-        apply_patches(patched, arch, None)
-        node_cache[cache_key] = patched
-
-    to = patched.model_options.setdefault("transformer_options", {})
-    to["promptrelay_mask_fn"] = mask_fn
-
-    return patched, conditioning
+def _segment_start_image_b64(seg: dict):
+    """Get a base64 (no data-URI prefix) start image for a timeline segment, or None.
+    Images send their file bytes directly; video segments send their first frame."""
+    seg_type = seg.get("type", "image")
+    path = _resolve_input_path(seg.get("imageFile") or seg.get("videoFile") or "")
+    if seg_type == "video" and path:
+        return video_utils.first_frame_b64(path)
+    if path:
+        try:
+            return video_utils.file_to_b64(path)
+        except Exception:
+            pass
+    b64 = seg.get("imageB64", "")
+    if b64 and not b64.startswith("/view?"):
+        return b64.split(",", 1)[1] if "," in b64 else b64
+    return None
 
 
 class LTXDirector(io.ComfyNode):
@@ -876,15 +777,12 @@ class LTXDirector(io.ComfyNode):
             display_name="LTX Director",
             category="WhatDreamsCost",
             description=(
-                "Same as Prompt Relay Encode, but local prompts and segment lengths are edited "
-                "visually as draggable blocks on a timeline. The duration_frames input only sets the "
-                "timeline scale (pixel space) — actual frame count is still read from the latent."
+                "Storyboard timeline that generates video with the Kling API (klingapi.com). "
+                "Each timeline segment becomes a Kling shot (image2video if it has an image, else "
+                "text2video); shots are downloaded and stitched, then sent to Kling Video Output. "
+                "Enter a single Kling API key below."
             ),
             inputs=[
-                io.Model.Input("model"),
-                io.Clip.Input("clip"),
-                io.Vae.Input("audio_vae", optional=True, tooltip="Optional. Connect an Audio VAE to generate audio latents."),
-                io.Latent.Input("optional_latent", optional=True, tooltip="Optional. Connect a latent to override the auto-generated one."),
                 io.String.Input(
                     "global_prompt", multiline=True, default="", force_input=True, optional=True,
                     tooltip="Conditions the entire video. Anchors persistent characters, objects, and scene context.",
@@ -978,403 +876,171 @@ class LTXDirector(io.ComfyNode):
                 ),
                 io.Boolean.Input(
                     "override_audio", default=False, optional=True,
-                    tooltip="Use the audio from the IC-LoRA video instead of using the audio track.",
+                    tooltip="Use the audio from an imported video segment instead of the audio track.",
+                ),
+                # --- Kling engine (appended last to keep the JS positional widget order intact) ---
+                io.String.Input(
+                    "kling_api_key", default="", optional=True,
+                    tooltip="Your klingapi.com key (Bearer). Saved in the workflow — blank it before sharing. "
+                            "Env var KLING_API_KEY is used if this is left empty.",
+                ),
+                io.Combo.Input(
+                    "model_name", options=kling_client.MODEL_NAMES, default=kling_client.MODEL_NAMES[0],
+                    optional=True, tooltip="Kling model to generate with.",
+                ),
+                io.Combo.Input(
+                    "mode", options=kling_client.MODES, default="standard", optional=True,
+                    tooltip="Kling quality mode.",
+                ),
+                io.Combo.Input(
+                    "aspect_ratio", options=["16:9", "9:16", "1:1"], default="16:9", optional=True,
+                    tooltip="Output aspect ratio (text-to-video; image-to-video follows the image).",
+                ),
+                io.String.Input(
+                    "negative_prompt", multiline=True,
+                    default="blurry, distorted, deformed, extra limbs, warping, low quality, jpeg artifacts",
+                    optional=True, tooltip="Things to avoid in every shot.",
+                ),
+                io.Float.Input(
+                    "cfg_scale", default=0.5, min=0.0, max=1.0, step=0.05, optional=True,
+                    tooltip="Prompt relevance (higher = follow the prompt more closely).",
+                ),
+                io.String.Input(
+                    "base_url", default=kling_client.DEFAULT_BASE_URL, optional=True,
+                    tooltip="Gateway base URL. Default is klingapi.com.",
                 ),
             ],
             outputs=[
-                io.Model.Output(display_name="model"),
-                io.Conditioning.Output(display_name="positive"),
-                io.Latent.Output(display_name="video_latent", tooltip="Auto-generated LTXV empty latent (only populated when no latent is connected)."),
-                io.Latent.Output(display_name="audio_latent", tooltip="Auto-generated audio latent (uses custom audio if enabled)."),
-                GuideData.Output(display_name="guide_data"),
-                MotionGuideData.Output(display_name="motion_guide_data"),
-                io.Float.Output(display_name="frame_rate", tooltip="The frame rate used for the timeline."),
-                io.Audio.Output(display_name="combined_audio", tooltip="Combined timeline audio layout."),
+                KlingVideo.Output(display_name="kling_video"),
             ],
         )
 
     @classmethod
-    def execute(cls, model, clip, start_second, end_second, duration_seconds, start_frame, end_frame, duration_frames,
-                timeline_data, local_prompts, segment_lengths, global_prompt="", guide_strength="", epsilon=1e-3,
-                frame_rate=24, display_mode="seconds",
-                custom_width=768, custom_height=512, resize_method="maintain aspect ratio",
-                divisible_by=32, img_compression=0, audio_vae=None, optional_latent=None,
-                use_custom_audio=False, inpaint_audio=True, use_custom_motion=True, override_audio=False) -> io.NodeOutput:
+    def execute(cls, global_prompt="", start_second=0.0, end_second=5.0, duration_seconds=5.0,
+                start_frame=0, end_frame=120, duration_frames=120, timeline_data="",
+                use_custom_audio=False, use_custom_motion=True, inpaint_audio=True,
+                local_prompts="", segment_lengths="", epsilon=1e-3, frame_rate=24,
+                display_mode="seconds", guide_strength="", custom_width=0, custom_height=0,
+                resize_method="maintain aspect ratio", divisible_by=32, img_compression=0,
+                override_audio=False, kling_api_key="", model_name=None, mode="standard",
+                aspect_ratio="16:9", negative_prompt="", cfg_scale=0.5, base_url=None) -> io.NodeOutput:
+        """Kling engine: turn the timeline into klingapi.com calls, then stitch the clips."""
 
-        # Parse timeline data
+        key = (kling_api_key or "").strip() or os.environ.get("KLING_API_KEY", "").strip()
+        if not key:
+            raise RuntimeError(
+                "LTX Director (Kling): no API key. Enter it in the kling_api_key field "
+                "or set the KLING_API_KEY environment variable."
+            )
+        base_url = (base_url or kling_client.DEFAULT_BASE_URL).strip()
+        model_name = model_name or kling_client.MODEL_NAMES[0]
+        fr = float(frame_rate) or 24.0
+
         try:
             tdata = json.loads(timeline_data) if timeline_data else {}
         except Exception as e:
-            log.error(f"[LTXDirector] execute timeline_data parse error: {e}")
+            log.error("[LTXDirector/Kling] timeline_data parse error: %s", e)
             tdata = {}
 
-        is_retake_mode = tdata.get("retakeMode", False)
-        is_retake_active = is_retake_mode and tdata.get("retakeVideo") is not None
-
-        # Extract global_prompt from timeline_data if not connected/empty
         if not global_prompt:
-            if is_retake_mode:
-                global_prompt = tdata.get("retake_global_prompt", "")
-            else:
-                global_prompt = tdata.get("global_prompt", "")
+            global_prompt = tdata.get("global_prompt", "") or ""
 
-        log.info(f"[LTXDirector] execute RECEIVED global_prompt: {repr(global_prompt)}")
+        # --- Build an ordered shot list from the timeline main track ---
+        win_start = int(start_frame)
+        win_end = int(start_frame) + int(duration_frames)
+        segs = [
+            s for s in tdata.get("segments", [])
+            if s.get("type", "image") in ("image", "video")
+            and int(s.get("start", 0)) < win_end
+            and int(s.get("start", 0)) + int(s.get("length", 1)) > win_start
+        ]
+        segs.sort(key=lambda s: int(s.get("start", 0)))
 
-        # --- Build guide_data from image segments FIRST (to derive output dimensions) ---
-        guide_data = {"images": [], "insert_frames": [], "strengths": [], "frame_rate": frame_rate}
-        derived_w, derived_h = custom_width, custom_height
-        try:
-            img_segs = [
-                s for s in tdata.get("segments", [])
-                if s.get("type", "image") in ("image", "video")
-                and (s.get("imageFile") or s.get("imageB64"))
-                and int(s.get("start", 0)) < start_frame + duration_frames
-                and int(s.get("start", 0)) + int(s.get("length", 1)) > start_frame
-            ]
-            img_segs.sort(key=lambda s: s["start"])
-
-            strengths = []
-            if guide_strength.strip():
-                strengths = [float(x.strip()) for x in guide_strength.split(",") if x.strip()]
-
-            for idx, seg in enumerate(img_segs):
-                seg_start = int(seg.get("start", 0))
-                offset = max(0, start_frame - seg_start)
-
-                if seg.get("type") == "video":
-                    if offset > 0:
-                        seg["trimStart"] = float(seg.get("trimStart", 0)) + offset
-                        seg["length"] = max(1, int(seg.get("length", 1)) - offset)
-                    tensor = _load_video_tensor(seg, float(frame_rate))
-                else:
-                    tensor = _load_image_tensor(seg)
-
-                # Apply resize
-                src_h, src_w = tensor.shape[1], tensor.shape[2]
-
-                def snap(val, div):
-                    return max(div, (val // div) * div)
-
-                if custom_width > 0 and custom_height > 0:
-                    # Both dimensions set — apply selected resize_method (pad, crop, stretch, maintain AR)
-                    tensor = _resize_image(tensor, custom_width, custom_height, resize_method, divisible_by)
-                elif custom_width > 0:
-                    # Width only — scale height from AR, snap both, then resize to exact dimensions
-                    tgt_w = snap(custom_width, divisible_by)
-                    tgt_h = snap(int(src_h * tgt_w / src_w), divisible_by)
-                    tensor = _resize_image(tensor, tgt_w, tgt_h, "stretch to fit", divisible_by)
-                elif custom_height > 0:
-                    # Height only — scale width from AR, snap both, then resize to exact dimensions
-                    tgt_h = snap(custom_height, divisible_by)
-                    tgt_w = snap(int(src_w * tgt_h / src_h), divisible_by)
-                    tensor = _resize_image(tensor, tgt_w, tgt_h, "stretch to fit", divisible_by)
-                else:
-                    # Both zero — keep original dimensions, just snap to divisible_by
-                    tensor = _resize_image(tensor, src_w, src_h, "maintain aspect ratio", divisible_by)
-
-
-                # Apply compression
-                if img_compression > 0:
-                    tensor = _compress_image(tensor, img_compression)
-
-                # Record dimensions of the first processed image for latent generation
-                if idx == 0:
-                    derived_h = tensor.shape[1]
-                    derived_w = tensor.shape[2]
-
-                if seg.get("isEndFrame"):
-                    insert_frame = max(0, seg_start + int(seg.get("length", 1)) - 1 - start_frame)
-                else:
-                    insert_frame = max(0, seg_start - start_frame)
-                strength = strengths[idx] if idx < len(strengths) else 1.0
-                guide_data["images"].append(tensor)
-                guide_data["insert_frames"].append(insert_frame)
-                guide_data["strengths"].append(float(strength))
-            
-            # If no images were loaded from the timeline, create a dummy image at strength 0
-            # to prevent artifacts in text-to-video mode.
-            if not guide_data["images"] and optional_latent is None:
-                src_w = derived_w if derived_w > 0 else 768
-                src_h = derived_h if derived_h > 0 else 512
-                
-                # If there's an IC-LoRA video or retake base video on the timeline, extract its dimensions for accurate aspect ratio scaling
-                tdata_motion = json.loads(timeline_data) if timeline_data else {}
-                found_dims = False
-                
-                # Check for retake base video first
-                is_retake = tdata_motion.get("retakeMode", False)
-                retake_vid = tdata_motion.get("retakeVideo") or {}
-                retake_file = retake_vid.get("imageFile", "") if isinstance(retake_vid, dict) else ""
-                if is_retake and retake_file:
-                    r_path = os.path.join(folder_paths.get_input_directory(), retake_file)
-                    if not os.path.exists(r_path):
-                        basename = os.path.basename(retake_file)
-                        fallback_path = os.path.join(folder_paths.get_input_directory(), "whatdreamscost", basename)
-                        if os.path.exists(fallback_path):
-                            r_path = fallback_path
-                    if os.path.exists(r_path):
-                        try:
-                            with av.open(r_path) as container:
-                                stream = container.streams.video[0]
-                                src_w = stream.width or stream.codec_context.width
-                                src_h = stream.height or stream.codec_context.height
-                                found_dims = True
-                        except:
-                            pass
-                
-                # Fallback to normal motion segments
-                if not found_dims:
-                    for mseg in tdata_motion.get("motionSegments", []):
-                        v_file = mseg.get("videoFile")
-                        if v_file:
-                            v_path = os.path.join(folder_paths.get_input_directory(), v_file)
-                            if not os.path.exists(v_path):
-                                basename = os.path.basename(v_file)
-                                fallback_path = os.path.join(folder_paths.get_input_directory(), "whatdreamscost", basename)
-                                if os.path.exists(fallback_path):
-                                    v_path = fallback_path
-                            if os.path.exists(v_path):
-                                try:
-                                    with av.open(v_path) as container:
-                                        stream = container.streams.video[0]
-                                        src_w = stream.width or stream.codec_context.width
-                                        src_h = stream.height or stream.codec_context.height
-                                        found_dims = True
-                                        break
-                                except:
-                                    pass
-
-                # Create a dummy tensor of the exact source dimensions
-                tensor = torch.zeros((1, src_h, src_w, 3), dtype=torch.float32)
-
-                def snap(val, div):
-                    return max(div, (val // div) * div)
-
-                # Route the dummy tensor through the exact same resizing pipeline
-                if custom_width > 0 and custom_height > 0:
-                    tensor = _resize_image(tensor, custom_width, custom_height, resize_method, divisible_by)
-                elif custom_width > 0:
-                    tgt_w = snap(custom_width, divisible_by)
-                    tgt_h = snap(int(src_h * tgt_w / src_w), divisible_by)
-                    tensor = _resize_image(tensor, tgt_w, tgt_h, "stretch to fit", divisible_by)
-                elif custom_height > 0:
-                    tgt_h = snap(custom_height, divisible_by)
-                    tgt_w = snap(int(src_w * tgt_h / src_h), divisible_by)
-                    tensor = _resize_image(tensor, tgt_w, tgt_h, "stretch to fit", divisible_by)
-                else:
-                    tensor = _resize_image(tensor, src_w, src_h, "maintain aspect ratio", divisible_by)
-                
-                guide_data["images"].append(tensor)
-                guide_data["insert_frames"].append(0)
-                guide_data["strengths"].append(0.0)
-                
-                derived_w = tensor.shape[2]
-                derived_h = tensor.shape[1]
-
-        except Exception as e:
-            log.warning("[PromptRelay] Could not build guide_data: %s", e)
-
-        # --- Auto-generate LTXV latent if none was provided ---
-        # Apply the community 8n+1 rule directly to the timeline's duration_frames:
-        # int(ceil(((duration_frames) - 1) / 8) * 8) + 1
-        # This ensures we get AT LEAST the requested frames, snapped to LTXV's requirements.
-        ltxv_length = int(math.ceil((duration_frames - 1) / 8.0) * 8) + 1
-        
-        if optional_latent is None:
-            latent_w = max(32, (derived_w // 32) * 32)
-            latent_h = max(32, (derived_h // 32) * 32)
-            # LTXV temporal: ((length - 1) // 8) + 1 latent frames; invert to get pixel frames -> length
-            latent_t = ((ltxv_length - 1) // 8) + 1
-            samples = torch.zeros(
-                [1, 128, latent_t, latent_h // 32, latent_w // 32],
-                device=comfy.model_management.intermediate_device(),
-            )
-            latent = {"samples": samples}
-            log.info(
-                "[PromptRelay] Auto-generated LTXV latent: %dx%d, %d pixel frames (%d latent frames)",
-                latent_w, latent_h, ltxv_length, latent_t,
-            )
+        shots = []  # each: {"prompt", "image" (b64 or None), "duration"}
+        if segs:
+            for s in segs:
+                p = (s.get("prompt") or global_prompt or "").strip() or "video"
+                dur = _snap_kling_duration(int(s.get("length", 1)) / fr)
+                shots.append({"prompt": p, "image": _segment_start_image_b64(s), "duration": dur})
         else:
-            latent = optional_latent
-
-        patched, conditioning = _encode_relay(
-            model, clip, latent, global_prompt, local_prompts, segment_lengths, epsilon,
-        )
-
-        # --- Build Audio Output ---
-        audio_out = _build_combined_audio(timeline_data, start_frame, ltxv_length, float(frame_rate), override_audio=override_audio)
-
-        # --- Audio Latent Generation ---
-        audio_latent = {}
-        
-        if audio_vae is not None:
-            # Helper to generate empty latent
-            def get_empty_latent():
-                # Support both raw AudioVAE objects and ComfyUI VAE wrappers.
-                inner = getattr(audio_vae, "first_stage_model", audio_vae)
-                z_channels = audio_vae.latent_channels
-                audio_freq = inner.latent_frequency_bins
-                num_audio_latents = inner.num_of_latents_from_frames(ltxv_length, float(frame_rate))
-                audio_latents = torch.zeros(
-                    (1, z_channels, num_audio_latents, audio_freq),
-                    device=comfy.model_management.intermediate_device(),
+            prompts = [p.strip() for p in (local_prompts or "").split("|") if p.strip()]
+            lengths = [x.strip() for x in (segment_lengths or "").split(",") if x.strip()]
+            if not prompts and global_prompt.strip():
+                prompts = [global_prompt.strip()]
+            if not prompts:
+                raise RuntimeError(
+                    "LTX Director (Kling): nothing to generate — add a prompt or an "
+                    "image/video segment to the timeline."
                 )
-                return {"samples": audio_latents, "type": "audio"}
-
-            if use_custom_audio or override_audio or is_retake_active:
+            for i, p in enumerate(prompts):
                 try:
-                    if audio_out is not None:
-                        # 1. Encode audio waveform into latent space
-                        waveform = audio_out["waveform"]
-                        if waveform.ndim == 2:
-                            waveform = waveform.unsqueeze(0)
-                        if waveform.ndim != 3:
-                            raise ValueError(
-                                f"Expected custom audio waveform with 2 or 3 dims, got shape {tuple(waveform.shape)}"
-                            )
+                    dur = _snap_kling_duration(float(lengths[i]) / fr) if i < len(lengths) else 5
+                except Exception:
+                    dur = 5
+                gp = global_prompt.strip()
+                full = f"{gp}, {p}" if (gp and gp not in p) else p
+                shots.append({"prompt": full, "image": None, "duration": dur})
 
-                        # Wrapped ComfyUI VAE expects (batch, samples, channels);
-                        # raw AudioVAE expects a dict with waveform in (batch, channels, samples).
-                        if hasattr(audio_vae, "first_stage_model"):
-                            latent_samples = audio_vae.encode(waveform.movedim(1, -1))
-                        else:
-                            latent_samples = audio_vae.encode({
-                                "waveform": waveform,
-                                "sample_rate": audio_out["sample_rate"],
-                            })
-                        
-                        if latent_samples.numel() == 0:
-                            raise ValueError("Encoded audio latent is empty (0 elements).")
-                        
-                        # 2. Create a 3D gap mask [B, F, H] to avoid accidental broadcasting to the 5D video latent 
-                        # which also has 128 channels. A 4D audio mask [1, 128, F, H] confuses ComfyUI's KSampler 
-                        # into masking the video latent as well, causing black frames.
-                        B, C, F_len, H_len = latent_samples.shape
-                        
-                        if is_retake_active:
-                            gap_mask = torch.zeros((B, F_len, H_len), dtype=torch.float32, device=latent_samples.device)
-                            
-                            retake_start = float(tdata.get("retakeStart", 0))
-                            retake_len = float(tdata.get("retakeLength", 0))
-                            
-                            overlap_start = max(start_frame, retake_start)
-                            overlap_end = min(start_frame + ltxv_length, retake_start + retake_len)
-                            
-                            if overlap_end > overlap_start:
-                                rel_start = overlap_start - start_frame
-                                rel_len = overlap_end - overlap_start
-                                
-                                start_sec = rel_start / float(frame_rate)
-                                len_sec = rel_len / float(frame_rate)
-                                total_sec = ltxv_length / float(frame_rate)
-                                
-                                start_idx = int((start_sec / total_sec) * F_len)
-                                end_idx = int(((start_sec + len_sec) / total_sec) * F_len)
-                                
-                                start_idx = max(0, min(F_len, start_idx))
-                                end_idx = max(0, min(F_len, end_idx))
-                                
-                                gap_mask[:, start_idx:end_idx, :] = 1.0
-                        else:
-                            gap_mask = torch.ones((B, F_len, H_len), dtype=torch.float32, device=latent_samples.device)
-                            
-                            audio_segs_key = "motionSegments" if override_audio else "audioSegments"
-                            file_key = "videoFile" if override_audio else "audioFile"
-                            for seg in tdata.get(audio_segs_key, []):
-                                if not seg.get(file_key):
-                                    continue
-                                
-                                seg_start = float(seg.get("start", 0))
-                                seg_len = float(seg.get("length", 1))
-                                
-                                if seg_start + seg_len <= start_frame or seg_start >= start_frame + ltxv_length:
-                                    continue
-                                    
-                                offset = max(0, start_frame - seg_start)
-                                seg_len = max(1.0, seg_len - offset)
-                                seg_start = max(0, seg_start - start_frame)
+        log.info("[LTXDirector/Kling] Generating %d shot(s) via %s @ %s", len(shots), model_name, base_url)
 
-                                start_sec = seg_start / float(frame_rate)
-                                len_sec = seg_len / float(frame_rate)
-                                total_sec = ltxv_length / float(frame_rate)
-
-                                start_idx = int((start_sec / total_sec) * F_len)
-                                end_idx = int(((start_sec + len_sec) / total_sec) * F_len)
-                                gap_mask[:, start_idx:end_idx, :] = 0.0
-                                
-                        if inpaint_audio:
-                            # Generate new audio in the gaps, preserve custom audio segments
-                            mask = gap_mask
-                        else:
-                            # Preserve the entire audio latent (no generation). 
-                            # We use a 3D zeros mask to prevent video blackouts.
-                            mask = torch.zeros((B, F_len, H_len), dtype=torch.float32, device=latent_samples.device)
-                        
-                        audio_latent = {
-                            "samples": latent_samples,
-                            "type": "audio",
-                            "noise_mask": mask
-                        }
-                        log.info("[PromptRelay] Generated custom audio latent with dynamic noise mask.")
-                    else:
-                        raise ValueError("No audio waveform to encode.")
-                except Exception as e:
-                    log.error("[PromptRelay] Failed to generate custom audio latent: %s", e)
-                    raise e
-            else:
-                # Generate empty latent
-                try:
-                    audio_latent = get_empty_latent()
-                    log.info("[PromptRelay] Auto-generated empty audio latent.")
-                except Exception as e:
-                    log.error("[PromptRelay] Could not generate empty audio latent: %s", e)
-                    raise e
-
-        # --- Motion guide output from timeline video segments ---
-        motion_guide_data = {"segments": [], "frame_rate": float(frame_rate), "duration_frames": int(duration_frames), "resize_method": resize_method}
+        # --- Generate each shot (submit -> poll -> download) ---
+        run_root = os.path.join(folder_paths.get_output_directory(), "kling_director")
+        os.makedirs(run_root, exist_ok=True)
         try:
-            tdata = json.loads(timeline_data) if timeline_data else {}
-            if use_custom_motion:
-                motion_segments = tdata.get("motionSegments", [])
-            else:
-                motion_segments = []
-            for seg in motion_segments:
-                seg_start = int(seg.get("start", 0))
-                length = int(seg.get("length", 1))
-                if seg_start >= start_frame + duration_frames or seg_start + length <= start_frame:
-                    continue
-                if not seg.get("videoFile"):
-                    continue
-                    
-                offset = max(0, start_frame - seg_start)
-                new_start = max(0, seg_start - start_frame)
-                
-                # Trim length so it doesn't extend beyond duration_frames
-                clipped_len = min(length - offset, duration_frames - new_start)
-                if clipped_len <= 0:
-                    continue
-                    
-                clean = dict(seg)
-                clean["start"] = new_start
-                clean["length"] = clipped_len
-                clean["trimStart"] = float(seg.get("trimStart", 0)) + offset
-                motion_guide_data["segments"].append(clean)
-        except Exception as e:
-            log.warning("[LTXDirector] Could not build motion_guide_data: %s", e)
+            run_id = "run_%d" % (len(os.listdir(run_root)) + 1)
+        except Exception:
+            run_id = "run"
+        run_dir = os.path.join(run_root, run_id)
+        os.makedirs(run_dir, exist_ok=True)
 
-        # Inject raw timeline details for downstream masking in Retake Mode
-        guide_data["timeline_data"] = timeline_data
-        guide_data["start_frame"] = start_frame
-        guide_data["duration_frames"] = duration_frames
-        guide_data["resize_method"] = resize_method
+        clip_paths = []
+        for i, shot in enumerate(shots):
+            try:
+                if shot["image"]:
+                    task_id = kling_client.submit_image2video(
+                        base_url, key, model_name, shot["prompt"], shot["image"],
+                        duration=shot["duration"], mode=mode,
+                        negative_prompt=negative_prompt, cfg_scale=cfg_scale,
+                    )
+                else:
+                    task_id = kling_client.submit_text2video(
+                        base_url, key, model_name, shot["prompt"],
+                        duration=shot["duration"], aspect_ratio=aspect_ratio, mode=mode,
+                        negative_prompt=negative_prompt, cfg_scale=cfg_scale,
+                    )
+                log.info("[LTXDirector/Kling] shot %d/%d submitted (task %s); polling…",
+                         i + 1, len(shots), task_id)
 
-        return io.NodeOutput(patched, conditioning, latent, audio_latent, guide_data, motion_guide_data, float(frame_rate), audio_out)
+                def _cb(status, waited, _i=i):
+                    log.info("[LTXDirector/Kling] shot %d/%d status=%s (%ss)",
+                             _i + 1, len(shots), status, waited)
 
+                video_url = kling_client.poll(base_url, key, task_id, on_status=_cb)
+                dest = os.path.join(run_dir, "shot%02d.mp4" % i)
+                kling_client.download(video_url, dest)
+                clip_paths.append(dest)
+                log.info("[LTXDirector/Kling] shot %d/%d downloaded -> %s", i + 1, len(shots), dest)
+            except kling_client.KlingError as e:
+                raise RuntimeError(f"LTX Director (Kling): shot {i + 1}/{len(shots)} failed — {e}") from e
 
-NODE_CLASS_MAPPINGS = {
-    "LTXDirector": LTXDirector,
-}
+        if not clip_paths:
+            raise RuntimeError("LTX Director (Kling): no clips were generated.")
 
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "PromptRelayEncodeTimeline": "Prompt Relay Encode (Timeline)",
-}
+        # --- Custom audio track (only when the user provided one) ---
+        audio = None
+        if use_custom_audio and tdata.get("audioSegments"):
+            try:
+                audio = _build_combined_audio(
+                    timeline_data, int(start_frame), int(duration_frames), fr, override_audio
+                )
+            except Exception as e:
+                log.warning("[LTXDirector/Kling] combined audio build failed: %s", e)
+
+        # --- Stitch ---
+        if len(clip_paths) == 1 and audio is None:
+            final_path = clip_paths[0]
+        else:
+            final_path = os.path.join(run_dir, "final.mp4")
+            video_utils.assemble(clip_paths, final_path, audio=audio)
+
+        return io.NodeOutput({"video_path": final_path, "frame_rate": fr, "audio": audio})
